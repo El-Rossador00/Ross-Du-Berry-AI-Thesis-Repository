@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+import sys, re, math, numpy as np
+from collections import defaultdict, Counter
+
+def parse_pgn(paths):
+    games = []
+    cur = {"W":None,"B":None,"R":None}
+    pat = re.compile(r'^\[(\w+)\s+"(.*)"\]\s*$')
+    for path in paths:
+        with open(path, 'r', errors='ignore') as f:
+            for line in f:
+                line=line.rstrip('\n')
+                if line.startswith('['):
+                    m = pat.match(line)
+                    if not m: 
+                        continue
+                    k,v = m.group(1), m.group(2)
+                    if k == "White": cur["W"]=v
+                    elif k == "Black": cur["B"]=v
+                    elif k == "Result": cur["R"]=v
+                elif line.strip()=="":
+                    if cur["W"] and cur["B"] and cur["R"]:
+                        games.append((cur["W"],cur["B"],cur["R"]))
+                    cur={"W":None,"B":None,"R":None}
+            if cur["W"] and cur["B"] and cur["R"]:
+                games.append((cur["W"],cur["B"],cur["R"]))
+            cur={"W":None,"B":None,"R":None}
+    return games
+
+def wdl_points(result, as_white=True):
+    if result == "1-0":
+        return (1,0,0,1.0) if as_white else (0,0,1,0.0)
+    if result == "0-1":
+        return (0,0,1,0.0) if as_white else (1,0,0,1.0)
+    if result in ("1/2-1/2","1/2-1/2 {Draw}","1/2-1/2 {Draw by 3-fold repetition}","1/2-1/2 {Stalemate}"):
+        return (0,1,0,0.5)
+    return (0,1,0,0.5)
+
+def fmt_pct(x): 
+    return f"{100.0*x:6.2f}"
+
+def elo_from_score(p):
+    p = min(max(p, 1e-9), 1-1e-9)
+    return 400.0 * math.log10(p/(1-p))
+
+def elo_ci95_from_p_n(p, n):
+    p = min(max(p, 1e-9), 1-1e-9)
+    if n <= 0: return float('nan')
+    g = 400.0 / math.log(10.0)
+    se = g * math.sqrt(1.0/(n * p * (1-p)))
+    return 1.96 * se
+
+def pretty_print(paths):
+    games = parse_pgn(paths)
+    if not games:
+        print("PGN not found or contained no games")
+        sys.exit(1)
+
+    engines = set()
+    per_engine = { }  
+    pair = defaultdict(lambda: {"A":None,"B":None,"g":0,"A_w":0,"draw":0,"B_w":0,"A_pts":0.0})
+
+    for W,B,R in games:
+        engines.add(W); engines.add(B)
+        for name in (W,B):
+            if name not in per_engine:
+                per_engine[name] = Counter(w=0,d=0,l=0,pts=0.0,g=0)
+        w,d,l,pt = wdl_points(R, as_white=True)
+        per_engine[W].update(w=w,d=d,l=l,pts=pt,g=1)
+        w2,d2,l2,pt2 = wdl_points(R, as_white=False)
+        per_engine[B].update(w=w2,d=d2,l=l2,pts=pt2,g=1)
+        A,Bb = sorted([W,B])
+        key = (A,Bb)
+        rec = pair[key]
+        rec["A"]=A; rec["B"]=Bb; rec["g"] += 1
+        if W == A:
+            if R == "1-0": rec["A_w"] += 1
+            elif R == "0-1": rec["B_w"] += 1
+            else: rec["draw"] += 1
+        else:
+            if R == "1-0": rec["B_w"] += 1
+            elif R == "0-1": rec["A_w"] += 1
+            else: rec["draw"] += 1
+
+    engs = sorted(engines)
+    print("=== Standings (counts + %) ===")
+    print(f"{'Engine':8} {'Games':>5} {'Wins':>5} {'Draws':>5} {'Losses':>6} {'ScorePct':>8}")
+    for e in sorted(engs, key=lambda x: (per_engine[x]['pts']/max(1,per_engine[x]['g'])), reverse=True):
+        g = per_engine[e]['g']; w=per_engine[e]['w']; d=per_engine[e]['d']; l=per_engine[e]['l']
+        pct = per_engine[e]['pts']/g if g>0 else 0.0
+        print(f"{e:8} {g:5d} {w:5d} {d:5d} {l:6d} {fmt_pct(pct)}")
+
+    print("\n=== Head-to-head (WDL + score) ===")
+    print(f"{'A':8} {'B':8} {'games':>5} {'A_wins':>6} {'draws':>5} {'A_losses':>8} {'A_score':>8} {'B_wins':>6} {'B_losses':>8} {'B_score':>8}")
+    for (A,Bb), rec in sorted(pair.items()):
+        g = rec["g"]; A_w=rec["A_w"]; D=rec["draw"]; B_w=rec["B_w"]
+        A_pts = A_w + 0.5*D; B_pts = B_w + 0.5*D
+        print(f"{A:8} {Bb:8} {g:5d} {A_w:6d} {D:5d} {B_w:8d} {A_pts/g:8.4f} {B_w:6d} {A_w:8d} {B_pts/g:8.4f}")
+
+    print("\n=== Pairwise Elo diffs (±95% CI) ===")
+    print(f"{'A':8} {'B':8} {'games':>5} {'A_score':>7} {'elo_A_minus_B':>14} {'elo_CI95':>9}")
+    pair_elo = {}  
+    for (A,Bb), rec in sorted(pair.items()):
+        g = rec["g"]; A_w=rec["A_w"]; D=rec["draw"]; B_w=rec["B_w"]
+        p = (A_w + 0.5*D)/g
+        p_show = p
+        d_elo = elo_from_score(p)
+        ci = elo_ci95_from_p_n(max(min(p,1-1e-9),1e-9), g)
+        print(f"{A:8} {Bb:8} {g:5d} {p_show:7.4f} {d_elo:14.2f} {ci:9.2f}")
+        pair_elo[(A,Bb)] = (d_elo, g, p)
+
+    idx = {e:i for i,e in enumerate(engs)}
+    n = len(engs)
+    L = np.zeros((n,n), dtype=float)
+    b = np.zeros(n, dtype=float)
+    for (A,Bb),(d_elo,g,p) in pair_elo.items():
+        i, j = idx[A], idx[Bb]
+        w = g  
+        L[i,i] += w
+        L[j,j] += w
+        L[i,j] -= w
+        L[j,i] -= w
+        b[i] += w * d_elo
+        b[j] -= w * d_elo
+    lam = 1e-6 * (L.diagonal().sum() / max(1,n))
+    L_ridge = L + lam*np.eye(n)
+    r = np.linalg.solve(L_ridge, b)
+    r = r - r.mean()
+
+    print("\n=== Global Elo (logistic LS, mean=0) ===")
+    print(f"{'Engine':8} {'Elo':>7}")
+    for e, val in sorted(zip(engs, r), key=lambda t: t[1], reverse=True):
+        print(f"{e:8} {val:7.1f}")
+
+    print("\n=== Per-pairing progress ===")
+    for (A,Bb), rec in sorted(pair.items()):
+        print(f"{A:8} vs {Bb:8} {rec['g']:5d} / {rec['g']:5d}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(2)
+    pretty_print(sys.argv[1:])
